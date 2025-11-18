@@ -1,0 +1,1037 @@
+---
+title: "HBEC Smoldering Red Oak Acute vs. Repeated Exposure Bulk Transreiptomic Analysis"
+author: "Elise Hickman"
+---
+
+# Set Up Workspace
+
+```{r message = FALSE, warning = FALSE}
+# Clear global environment
+rm(list=ls())
+
+# Load packages
+library(this.path) # for file path
+library(tidyverse) # for data organization and manipulation
+library(openxlsx) # for reading and writing out files
+library(patchwork) # for reeating figure panels
+library(pheatmap) # for reeating heatmaps
+library(janitor) # for data cleaning
+library(RUVSeq) # for exploring data normalization
+library(factoextra) # for PCA plots
+library(DESeq2) # for differential gene expression
+library(biomaRt) # for gene names
+library(eulerr) # for results visualization
+library(scales) # for results visualization
+
+# Redefine functions that may be masked
+select <- dplyr::select
+rename <- dplyr::rename
+margin <- ggplot2::margin
+
+# Set theme
+theme_set(theme_bw())
+
+# Set working directory
+setwd(this.dir())
+```
+
+# Import and Organize Data
+
+Initial import:
+```{r}
+# Sample key import
+sample_key <- read.xlsx("2_SampleInfo/SampleKey_BulkRNASeq.xlsx") %>%
+  unite("exposure_paradigm", exposure, paradigm, remove = FALSE, sep = "_")
+
+# Data import 
+count_data_raw <- read.csv("1_RawData/RawData_BulkRNASeq_GeneCounts.csv") %>% as.data.frame()
+```
+
+Initial cleaning steps:
+
+1. Remove genes with 0 counts in all samples.
+2. Remove arbitrary numbers from gene names and replace with "_1", "_2", etc if there are duplicates.
+
+```{r}
+# Function for making unique names 
+## Input = vector (x) and separation character(s) (sep) such as "_"
+## Output = vector with duplicated elements renamed with _1, _2, _3 appended (for example)
+make.unique.custom = function(x, sep=sep){
+    ave(x, x, FUN=function(a){if(length(a) > 1){paste(a, 1:length(a), sep=sep)} else {a}})
+}
+
+
+# Clean data frame
+count_data_cleaned <- count_data_raw %>%
+  
+  # Remove rows with all zeroes
+  filter(if_all(everything(.), ~. != 0)) %>%
+
+  # Remove number at the end of each gene
+  separate(Gene, into = c("Gene", NA), sep = "_") %>%
+  
+  # Add back unique identifier if necessay
+  mutate(Gene_Unique = make.unique.custom(Gene, sep = "_")) %>%
+  
+  # Move new column to the front of the data frame
+  relocate(Gene_Unique, .after = "Gene")
+
+# Count genes detected and number of unique genes
+nrow(count_data_cleaned)
+
+length(unique(count_data_cleaned$Gene))
+```
+
+14,324 unique genes were detected, and 12,738 were unique genes. 
+
+```{r}
+# Save gene key in case it is needed in the future 
+gene_key <- count_data_cleaned %>% dplyr::select(c(Gene, Gene_Unique))
+
+# Remove column with just genes (not unique) and put dataframe in same order as sample key
+col_order <- sample_key$sample_name
+
+count_data_cleaned <- count_data_cleaned %>% 
+  dplyr::select(-Gene) %>%
+  column_to_rownames("Gene_Unique") %>%
+  dplyr::select(all_of(col_order))
+
+# Save cleaned data 
+write.xlsx(count_data_cleaned %>% rownames_to_column("gene") %>% arrange(gene), "3_ProcessedData/ProcessedData_BulkRNASeq_RawCounts_Cleaned.xlsx")
+
+# Save ceaned sample key
+write.xlsx(sample_key %>% 
+             select(c(sample_name, sex, age, race, donor, exposure_paradigm)), 
+           "2_SampleInfo/SampleKey_BulkRNASeq_Cleaned.xlsx")
+```
+
+
+# Process Data
+
+## RUV Normalization
+
+Here, we can explore unwanted variation using the Remove Unwanted Variation (RUV) package. It is possible that we have unwanted variation due to samples be collected a few days apart or the heterogenous nature of the primary HBEC cultures, although it is less likely than in studies of complex tissues or when integrating datasets across multiple sources/studies. The first step in the Remove Unwanted Variation (RUV) workflow is reeating the relative log expression (RLE) plot, which shows boxplots of the log-ratios of read counts of each sample to those of a reference sample (the median across all the samples). Ideally, distributions should be centered around the zero line and as tight as possible. Note that it is important that your count data frame columns (samples) are in the same order as in your sample_key dataframe. 
+
+```{r}
+# Transpose data frame and add in treatment condition
+count_data_t <- count_data_cleaned %>% 
+  t() %>% data.frame() %>%
+  rownames_to_column("sample_name")
+
+count_data_t <- sample_key %>% 
+  select(c(sample_name, exposure_paradigm, donor)) %>%
+  left_join(count_data_t, by = "sample_name")
+
+# Store IDs as a separate vector
+ID <- count_data_t$sample_name
+
+# Store conditions as a separate vector
+groups <- as.factor(count_data_t$exposure_paradigm)
+
+# Set control label
+ctrl <- "VEH_Acute"
+
+# Extract vector of other groups
+other_groups <- setdiff(groups, ctrl)
+
+# reeate SeqExpressionSet
+exprSet <- newSeqExpressionSet(as.matrix(count_data_cleaned),
+                               phenoData = data.frame(groups, 
+                                                      row.names = colnames(count_data_cleaned)))
+
+# Show groups whose distributions vary from the overall
+colors <- c("gold1", "steelblue2", "darkorange1", "magenta3")
+plotRLE(exprSet, outline=FALSE, col = colors[groups])
+```
+We can also visualize the data using a PCA plot to see if samples group as expected.
+```{r}
+# Plot PCA
+plotPCA(exprSet, col=colors[groups], cex=1.2)
+```
+
+The following code removes unwanted variation using the RUVg approach and generates the same visualizations as above with the adjusted data. 
+```{r}
+# Construct a matrix specifying the replicates (samples of the same condition)
+differences <- makeGroups(groups)
+
+# Capture 1 factor of unwanted variation (k = 1)
+ruv_set <- RUVs(exprSet, rownames(count_data_cleaned), k=1, differences) 
+
+# View updated distributions per sample
+plotRLE(ruv_set, outline=FALSE, col = colors[groups])
+```
+We can see that data are more centered around zero now, and the spread is about the same areoss groups. We can also generate a PCA plot:
+
+```{r}
+# PCA
+plotPCA(ruv_set, col=colors[groups], cex=1.2)
+```
+
+Overall, we don't see much in the way of differences between the raw data and the RUV data, so we will proceed with the raw data. 
+
+## Sample Outlier Exploration
+
+### PCA
+
+```{r}
+# Run PCA
+pca_res_counts <- prcomp(t(count_data_cleaned %>% as.matrix), center = TRUE, scale = TRUE)
+
+# reeate a scoring funciton to detect PCA sample outliers. The input is PCA results data frame and the number of standard deviations for the cutoff. The output is outlier names. 
+outlier_detection = function(pca_df, sd){
+
+    # getting scores
+    scores = pca_df$x
+    
+    # identifying samples that are > x standard deviations away from the mean
+    outlier_indices = apply(scores, 2, function(x) which( abs(x - mean(x)) > (sd * sd(x)) )) 
+    
+    # Select first three PCs and collapse results
+    outlier_indices <- outlier_indices[1:3] %>%
+        Reduce(union, .)
+    
+    # getting sample names
+    outliers = rownames(scores)[outlier_indices]
+    
+    return(outliers)
+}
+
+outlier_detection(pca_res_counts, 6)
+```
+
+No outliers were detected at 6 SD from the mean. Next we can visualize any patterns in our data by overlaying sample characteritics onto the PCA plot.
+
+```{r}
+# Visualize axes contributions
+fviz_eig(pca_res_counts)
+```
+
+Most variation is captured in first two PCs, so we will plot those:
+
+```{r}
+# Modify sample key for cleaner labels
+sample_key <- sample_key %>%
+  mutate(exposure_paradigm_cleaned = recode(exposure_paradigm, "RO_Acute" = "Acute Red Oak" , "RO_Repeated" = "Repeated Red Oak", "VEH_Acute" = "Acute Vehicle", "VEH_Repeated" = "Repeated Vehicle"))
+
+# PCA plot - By Exposure
+pca_plot_exposure <- fviz_pca_ind(pca_res_counts, 
+             label = "none",
+             pointsize = 5,
+             habillage = sample_key$exposure_paradigm_cleaned,
+             mean.point = FALSE,
+             title = "PCA - Raw Counts, By Exposure",
+             addEllipses = TRUE) +
+  scale_color_manual(name = "Exposure", values = c("gold1", "steelblue2", "darkorange1","magenta3")) + 
+  scale_fill_manual(name = "Exposure", values = c("gold1", "steelblue2", "darkorange1","magenta3")) + 
+  scale_shape_manual(name = "Exposure", values = c(15, 16, 17, 18)) + 
+  theme(axis.title = element_text(size = 16),
+        axis.title.x = element_text(margin = ggplot2::margin(t = 10, r = 0, b = 0, l = 0)),
+        axis.title.y = element_text(margin = ggplot2::margin(t = 0, r = 10, b = 0, l = 0)),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 18),
+      axis.text = element_text(size = 12))
+
+# PCA plot - By Donor
+pca_plot_donor <- fviz_pca_ind(pca_res_counts, 
+             label = "none",
+             pointsize = 5,
+             habillage = sample_key$donor,
+             mean.point = FALSE,
+             title = "PCA - Raw Counts, By Donor",
+             addEllipses = TRUE) +
+  scale_color_manual(name = "Donor", values = c("#7ad151", "#22a884", "#2a788e", "#414487")) +
+  scale_fill_manual(name = "Donor", values = c("#7ad151", "#22a884", "#2a788e", "#414487")) +
+  scale_shape_manual(name = "Donor", values = c(15, 16, 17, 18)) + 
+  theme(axis.title = element_text(size = 16),
+        axis.title.x = element_text(margin = ggplot2::margin(t = 10, r = 0, b = 0, l = 0)),
+        axis.title.y = element_text(margin = ggplot2::margin(t = 0, r = 10, b = 0, l = 0)),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 18),
+      axis.text = element_text(size = 12))
+
+# Make figure panel
+pca_rnaseq_panel <- pca_plot_exposure + pca_plot_donor
+
+# Save figure panel
+png(file = "4_Figures/PCAPanel_BulkRNASeq_RawCounts.png",
+    width = 14, height = 5, units = "in", res = 1200)
+pca_rnaseq_panel
+invisible(dev.off())
+
+# View figure panel
+pca_rnaseq_panel
+```
+
+We do not observe any apparent outliers.
+
+### Hierarchical Clustering
+
+We can also use hierarchical clustering to see if any samples cluster away from other samples and thus may be an outlier. 
+
+```{r}
+# reeate annotation key
+hm_anno <- sample_key %>%
+  select(sample_name, donor, exposure_paradigm_cleaned) %>%
+  column_to_rownames("sample_name") %>%
+  dplyr::rename("Donor" = "donor", "Exposure" = "exposure_paradigm_cleaned")
+
+# reeate color key
+hm_anno_color <- list('Donor' = c("D1" = "#7ad151", "D2" = "#22a884", "D3" = "#2a788e", "D4" = "#414487"),
+                      'Exposure' = c("Acute Red Oak" = "gold1", "Acute Vehicle" = "steelblue2", "Repeated Red Oak" = "darkorange1", "Repeated Vehicle" = "magenta3"))
+
+
+heatmap_raw_counts <- pheatmap(t(count_data_cleaned %>% as.matrix()),
+                               scale = "column",
+                               annotation_row = hm_anno,
+                               annotation_colors = hm_anno_color,
+                               annotation_names_row = FALSE,
+                               fontsize_col = 7, 
+                               treeheight_row = 20, 
+                               show_colnames = FALSE,
+                               show_rownames = FALSE)
+
+png(file = "4_Figures/Heatmap_BulkRNASeq_RawCounts.png",
+    width = 10, height = 5, units = "in", res = 1200)
+heatmap_raw_counts
+invisible(dev.off())
+```
+
+Here, we do not see any samples clustering on their own. Overall, these results combined with our PCA results, indicate that there are no sample outliers in our dataset. 
+
+# DESeq2
+
+We can now prepare our data for DESeq2:
+
+```{r warning = FALSE}
+# Prepare sample key for DESeq2
+sample_key_deseq <- sample_key %>% 
+  column_to_rownames("sample_name")
+
+# reeate object
+deseq_input <- DESeqDataSetFromMatrix(countData = count_data_cleaned, 
+                                      colData = sample_key_deseq, 
+                                      design = ~ donor + exposure_paradigm) 
+```
+
+Then, we can run DESeq and extract the contrasts and significant results we are interested in:
+```{r warning = FALSE, message = FALSE}
+# Run DESeq
+deseq_res <- DESeq(deseq_input)
+
+# Extract results
+deseq_res_ac <- as.data.frame(results(deseq_res, contrast = (c("exposure_paradigm", "RO_Acute", "VEH_Acute"))))
+deseq_res_re <- as.data.frame(results(deseq_res, contrast = (c("exposure_paradigm", "RO_Repeated", "VEH_Repeated"))))
+
+# Filter for only significantly changed genes
+deseq_res_ac_filtered <- deseq_res_ac %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 0.585)
+
+deseq_res_re_filtered <- deseq_res_re %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 0.585)
+
+# Write out normalized count data
+norm_counts <- counts(deseq_res, normalized = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene")
+
+write.xlsx(norm_counts %>% arrange(gene), "3_ProcessedData/ProcessedData_BulkRNASeq_DESeq2NormalizedCounts.xlsx")
+```
+
+Exploring the results a little bit:
+```{r}
+# How many for acute exposure are up vs down?
+nrow(deseq_res_ac_filtered)
+nrow(deseq_res_ac_filtered %>% filter(log2FoldChange < -0.585))
+nrow(deseq_res_ac_filtered %>% filter(log2FoldChange > 0.585))
+
+# How many for chronic exposure are up vs down?
+nrow(deseq_res_re_filtered)
+nrow(deseq_res_re_filtered %>% filter(log2FoldChange < -0.585))
+nrow(deseq_res_re_filtered %>% filter(log2FoldChange > 0.585))
+
+# How many overlap? 
+length(intersect(rownames(deseq_res_ac_filtered), rownames(deseq_res_re_filtered)))
+
+# How many overlap in the same direction? 
+deseq_res_sum_ac <- deseq_res_ac_filtered %>%
+  mutate(direction = ifelse(log2FoldChange < -0.585, "down", "up")) %>%
+  rownames_to_column("gene") %>%
+  unite("gene_direction", gene, direction, sep = "..", remove = FALSE)
+
+deseq_res_sum_re <- deseq_res_re_filtered %>%
+  mutate(direction = ifelse(log2FoldChange < -0.585, "down", "up")) %>%
+  rownames_to_column("gene") %>%
+  unite("gene_direction", gene, direction, sep = "..", remove = FALSE)
+
+length(intersect(deseq_res_sum_ac$gene_direction, deseq_res_sum_re$gene_direction))
+
+conserved_genes <- data.frame(gene_direction = intersect(deseq_res_sum_ac$gene_direction, deseq_res_sum_re$gene_direction)) %>%
+  separate(gene_direction, into = c("gene", "direction"), sep = "\\..") 
+
+conserved_genes %>% dplyr::count(direction)
+```
+In the acute exposure experiment, 214 genes were differentially expressed, with 165 upregulated and 49 downregulated. In the chronic exposure experiment, 172 genes were differentially expressed, with 107 upregulated and 65 downregulated. 62 of these gene expression changes were shared between acute and chronic, and they were all changed in the same direction (12 down, 50 up). 
+
+
+We can also explore the default filtering performed by DESeq:
+```{r}
+# How many genes have NA p-values? (Indicating that they were filtered out?)
+deseq_res_ac_nona <- na.omit(deseq_res_ac)
+deseq_res_re_nona <- na.omit(deseq_res_re)
+
+# What was the filter threshold for acute?
+deseq_res_ac_filtexp <- results(deseq_res, contrast = (c("exposure_paradigm", "RO_Acute", "VEH_Acute")))
+deseq_res_re_filtexp <- results(deseq_res, contrast = (c("exposure_paradigm", "RO_Repeated", "VEH_Repeated")))
+
+metadata(deseq_res_ac_filtexp)$filterThreshold
+metadata(deseq_res_re_filtexp)$filterThreshold
+```
+Writing out of results by exposure paradigm for interpretation:
+```{r eval = FALSE}
+# Write out results
+write.xlsx(deseq_res_ac %>% rownames_to_column("gene"), "5_Tables/DESeq2_Results_Acute.xlsx")
+write.xlsx(deseq_res_re %>% rownames_to_column("gene"), "5_Tables/DESeq2_Results_Repeated.xlsx")
+```
+
+Formatting and writing out of results for supplemental table:
+```{r}
+# Get full gene names from ensembl
+
+## Get names
+gene_names_df <- deseq_res_ac %>%
+  rownames_to_column("gene_cleaned") %>%
+  separate(gene_cleaned, into = c("gene", NA), remove = FALSE)
+
+gene_names_vec <- gene_names_df %>%
+  pull("gene") %>% 
+  unique()
+
+## Query ensembl
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+gene_info <- getBM(
+  attributes = c("hgnc_symbol", "description"),
+  filters = "hgnc_symbol",
+  values = gene_names_vec,
+  mart = ensembl
+) %>% 
+  mutate(description_clean = str_remove(description, "\\[.*")) %>%
+  select(c(hgnc_symbol, description_clean))
+
+## Make key
+gene_description_key <- gene_names_df %>%
+  select(c(gene_cleaned, gene)) %>%
+  left_join(gene_info, join_by("gene" == "hgnc_symbol")) %>%
+  select(-gene)
+
+
+# Format
+deseq_res_forsuppl <- deseq_res_ac %>%
+  rownames_to_column("gene") %>%
+  select(c(gene, log2FoldChange, pvalue, padj)) %>%
+  rename("log2foldchange_acute" = "log2FoldChange", "p_acute" = "pvalue", "padj_acute" = "padj") %>%
+  left_join(deseq_res_re %>% 
+              rownames_to_column("gene") %>% 
+              select(c(gene, log2FoldChange, pvalue, padj)) %>%
+              rename("log2foldchange_repeated" = "log2FoldChange", "p_repeated" = "pvalue", "padj_repeated" = "padj"),
+            by = "gene") %>%
+  left_join(gene_description_key, join_by("gene" == "gene_cleaned")) %>%
+  mutate(sig_acute = ifelse(padj_acute < 0.05, "Yes", "No"),
+         sig_repeated = ifelse(padj_repeated < 0.05, "Yes", "No")) %>%
+  relocate(description_clean, .after = "gene") %>%
+  relocate(sig_acute, .after = "padj_acute") %>%
+  relocate(sig_repeated, .after = "padj_repeated")
+  
+# Save
+write.xlsx(deseq_res_forsuppl %>% arrange(gene), "5_Tables/DESeq2_Results_ForSupplement.xlsx")
+```
+
+
+# Results Interpretation
+
+## For manual gene query
+
+What are the differentially expressed genes unique to each exposure?
+```{r}
+ac_genes_all <- deseq_res_ac_filtered %>%
+  rownames_to_column("Gene_Unique") %>%
+  pull("Gene_Unique")
+
+re_genes_all <- deseq_res_re_filtered %>%
+  rownames_to_column("Gene_Unique") %>%
+  pull("Gene_Unique")
+
+ac_genes_unique <- setdiff(ac_genes_all, re_genes_all)
+re_genes_unique <- setdiff(re_genes_all, ac_genes_all)
+
+deseq_res_ac_filtered_unique <- deseq_res_ac_filtered %>%
+  rownames_to_column("gene") %>%
+  dplyr::filter(gene %in% ac_genes_unique) %>%
+  arrange(-log2FoldChange)
+
+deseq_res_re_filtered_unique <- deseq_res_re_filtered %>%
+  rownames_to_column("gene") %>%
+  dplyr::filter(gene %in% re_genes_unique) %>%
+  arrange(-log2FoldChange)
+```
+
+## IPA output
+
+Export data for IPA, specifically exporting significantly deferentially expressed genes.
+```{r warning = FALSE}
+ipa_input_ac_filtered <- deseq_res_ac %>%
+  rownames_to_column("Gene_Unique") %>%
+  separate(Gene_Unique, into = c("Gene", NA), sep = "_") %>%
+  select(c(Gene, log2FoldChange, padj)) %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 0.585)
+
+ipa_input_re_filtered <- deseq_res_re %>%
+  rownames_to_column("Gene_Unique") %>%
+  separate(Gene_Unique, into = c("Gene", NA), sep = "_") %>%
+  select(c(Gene, log2FoldChange, padj)) %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 0.585)
+
+# Note that in IPA, repeated is called "chronic" (changed group name for accuracy)
+write.xlsx(ipa_input_ac_filtered, "3_ProcessedData/ProcessedData_IPA_Input_Acute.xlsx")
+write.xlsx(ipa_input_re_filtered, "3_ProcessedData/ProcessedData_IPA_Input_Repeated.xlsx")
+```
+
+# Results Visualization
+
+## Euler Plots
+
+Genes with increased expression:
+
+```{r}
+ac_genes_up <- deseq_res_ac_filtered %>%
+  filter(log2FoldChange > 0.585) %>%
+  rownames_to_column("Gene_Unique") %>%
+  pull("Gene_Unique")
+
+re_genes_up <- deseq_res_re_filtered %>%
+  filter(log2FoldChange > 0.585) %>%
+  rownames_to_column("Gene_Unique") %>%
+  pull("Gene_Unique")
+
+sig_genes_up <- list("Acute" = ac_genes_up, "Repeated" = re_genes_up)
+
+euler_fit_up <- euler(sig_genes_up)
+
+euler_up <- plot(euler_fit_up, 
+     quantities = TRUE, 
+     fills = list(fill = c("lightgoldenrod1", "sandybrown")))
+
+png(file = "4_Figures/Euler_BulkRNASeq_IncrExpr.png",
+    width = 3.5, height = 2, units = "in", res = 1200)
+euler_up 
+invisible(dev.off())
+
+euler_up 
+```
+
+Genes with decreased expression:
+
+```{r}
+ac_genes_down <- deseq_res_ac_filtered %>%
+  filter(log2FoldChange < -0.585) %>%
+  rownames_to_column("Gene_Unique") %>%
+  pull("Gene_Unique")
+
+re_genes_down <- deseq_res_re_filtered %>%
+  filter(log2FoldChange < -0.585) %>%
+  rownames_to_column("Gene_Unique") %>%
+  pull("Gene_Unique")
+
+sig_genes_down <- list("Acute" = ac_genes_down, "Repeated" = re_genes_down)
+
+euler_fit_down <- euler(sig_genes_down)
+
+euler_down <- plot(euler_fit_down, 
+     quantities = TRUE, 
+     fills = list(fill = c("lightgoldenrod1", "sandybrown")))
+
+png(file = "4_Figures/Euler_BulkRNASeq_DecrExpr.png",
+    width = 3.5, height = 2, units = "in", res = 1200)
+euler_down
+invisible(dev.off())
+
+euler_down
+```
+
+## PCA
+
+Clustering on just significant genes:
+
+```{r}
+# reeate a vector of all differentially expressed genes areoss both pairwise comparisions
+sig_genes_all_vec <- union(ac_genes_all, re_genes_all)
+
+# Extract normalized count data
+count_data_norm <- as.data.frame(counts(deseq_res, normalized = TRUE)) 
+
+# Filter normalized count data to only significant genes
+count_data_norm_filtered <- count_data_norm %>%
+  rownames_to_column("Gene_Unique") %>%
+  filter(Gene_Unique %in% sig_genes_all_vec) %>%
+  column_to_rownames("Gene_Unique")
+
+# Run PCA
+pca_res_counts_norm_filtered <- prcomp(t(count_data_norm_filtered %>% as.matrix()), center = TRUE, scale = TRUE)
+
+# Plot variation explained by the dimensions
+fviz_eig(pca_res_counts_norm_filtered)
+
+# PCA plot - Dim1 vs. Dim2
+pca_plot_counts_norm_filtered <- fviz_pca_ind(pca_res_counts_norm_filtered, 
+             label = "none",
+             pointsize = 5,
+             habillage = sample_key$exposure_paradigm_cleaned,
+             mean.point = FALSE,
+             title = "PCA - Significant Genes",
+             addEllipses = TRUE) +
+  scale_color_manual(name = "Exposure", values = c("gold1", "steelblue2", "darkorange1","magenta3")) + 
+  scale_fill_manual(name = "Exposure", values = c("gold1", "steelblue2", "darkorange1","magenta3")) + 
+  scale_shape_manual(name = "Exposure", values = c(15, 16, 17, 18)) + 
+  theme(axis.title = element_text(size = 16),
+        axis.title.x = element_text(margin = ggplot2::margin(t = 10, r = 0, b = 0, l = 0)),
+        axis.title.y = element_text(margin = ggplot2::margin(t = 0, r = 10, b = 0, l = 0)),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 22, face = "bold"),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 18),
+      axis.text = element_text(size = 12))
+
+png(file = "4_Figures/PCAPlot_BulkRNASeq_NormCounts_Sig.png",
+    width = 7, height = 4.5, units = "in", res = 1200)
+pca_plot_counts_norm_filtered
+invisible(dev.off())
+
+pca_plot_counts_norm_filtered
+```
+
+## Hierarchical clustering
+
+```{r}
+# Make heatmap
+hm_norm_genes <- pheatmap(t(count_data_norm_filtered %>% as.matrix()),
+         scale = "column",
+         fontsize_col = 7, 
+         treeheight_row = 20, 
+         annotation_row = hm_anno,
+         annotation_colors = hm_anno_color,
+         annotation_names_row = FALSE,
+         show_colnames = FALSE,
+         show_rownames = FALSE)
+
+hm_norm_genes
+
+# Optionally write out
+#png(file = "4_Figures/Heatmap_BulkRNASeq_NormCounts_Sig.png",
+    #width = 10, height = 6, units = "in", res = 1200)
+#hm_norm_genes
+#invisible(dev.off())
+```
+
+## Volcano plots
+
+Creating these volcano plots was more difficult than expected due to a few genes having very low p-values and high fold changes. To keep the labeling correct with a break in the y axis, one panel is needed for the bottom part of the figure and one panel for the top part, then these components are stitched together using patchwork. 
+
+First, select proteins to display for the volcano plots. Hand-selecting these based on a combination of genes shared and unique to the acute and repeated conditions, as well as genes with known interactions with lung biology. ~5 upregulated and 5 downregulated for each plot (difficult to fit more than that).
+```{r}
+# Get genes that overlap between acute and repeated
+up_overlap <- intersect(ac_genes_up, re_genes_up)
+down_overlap <- intersect(ac_genes_down, re_genes_down)
+
+# Filter results for genes that overlap
+deseq_res_forsuppl_upintersect <- deseq_res_forsuppl %>% filter(gene %in% all_of(up_overlap))
+deseq_res_forsuppl_downintersect <- deseq_res_forsuppl %>% filter(gene %in% all_of(down_overlap))
+
+# Vector of proteins to label
+volcano_genes_ac <- c("CYP1B1", "IL24", "TIPARP", "IL19", "TIMP3", "SPDEF", "WNT10A", "EDN2", "IL33", "ADRA2A", "EGR3")
+volcano_genes_re <- c("CYP1B1", "IL24", "TIPARP", "NQO1_2", "SPDEF", "WNT10A", "DACT2", "EDN2", "IL33", "PGF", "IL1R2") %>% str_replace("_.*", "")
+
+# Prepare dataframes for graphing
+deseq_res_ac_volcano <- deseq_res_ac %>%
+  rownames_to_column("gene") %>%
+  mutate(gene_cleaned = str_replace(gene, "_.*", "")) %>%
+  mutate(diffexpr = ifelse(log2FoldChange < -0.585 & padj < 0.05, "Decreased", 
+                           ifelse(log2FoldChange > 0.585 & padj < 0.05, "Increased", "NS"))) %>%
+  na.omit()
+
+deseq_res_re_volcano <- deseq_res_re %>%
+  rownames_to_column("gene") %>%
+  mutate(gene_cleaned = str_replace(gene, "_.*", "")) %>%
+  mutate(diffexpr = ifelse(log2FoldChange < -0.585 & padj < 0.05, "Decreased", 
+                           ifelse(log2FoldChange > 0.585 & padj < 0.05, "Increased", "NS"))) %>%
+  na.omit()
+
+# Get axis limits
+min(deseq_res_ac_volcano$log2FoldChange)
+max(deseq_res_ac_volcano$log2FoldChange)
+min(deseq_res_ac_volcano$padj)
+
+min(deseq_res_re_volcano$log2FoldChange)
+max(deseq_res_re_volcano$log2FoldChange)
+min(deseq_res_re_volcano$padj)
+
+# Also manually browse and sort the p-values and fold changes to understand the range. 
+```
+
+Then, make the plots. 
+
+### Acute exposure
+
+```{r}
+# Lower plot
+volcano_ac_lower <- deseq_res_ac_volcano %>% filter(-log10(padj) < 30) %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj), color = diffexpr)) +
+        geom_point(alpha = 0.7, aes(y = -log10(padj))) + 
+        scale_color_manual(values = c("#3A6DB0", "#D93227", "gray") , 
+                           breaks = c("Decreased", "Increased", "NS")) +
+        
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+        geom_vline(xintercept = 0.585, linetype = "dashed", color = "black") +
+        geom_vline(xintercept = -0.585, linetype = "dashed", color = "black") +
+  
+        geom_label_repel(data = deseq_res_ac_volcano %>% filter(gene_cleaned %in% volcano_genes_ac) %>% filter(-log10(padj) < 30),
+                         aes(color = diffexpr, label = gene_cleaned, y = -log10(padj)),
+                        show.legend = FALSE,
+                        max.overlaps = 12,
+                        fill = "white",
+                        size = 5,
+                        label.r = 0.2,
+                        label.size = 0.5,
+                        min.segment.length = 0) + 
+
+        xlim(-6, 6) +
+        scale_y_continuous(limits = c(0, 30)) + 
+  
+        labs(x = bquote(~Log[2]~'(Fold Change)'),
+             y = bquote(~-Log[10]~'(BH-adjusted p-value)')) +
+      
+        theme(axis.line = element_line(colour = "black"), 
+              axis.title.x = element_text(margin = ggplot2::margin(t = 15), size = 17),
+              axis.title.y = element_text(margin = ggplot2::margin(r = 15), size = 17),
+              axis.text = element_text(size = 15),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              panel.border = element_blank(),
+              legend.title = element_blank(),
+              legend.text = element_text(size = 15),
+              legend.position = "bottom",
+              legend.justification = "center",
+              legend.box.background = element_rect(color = "gray25")) 
+
+# Upper plot
+volcano_ac_upper <- deseq_res_ac_volcano %>% filter(-log10(padj) > 100) %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj), color = diffexpr)) +
+        geom_point(alpha = 0.7, aes(y = -log10(padj))) + 
+        scale_color_manual(values = c("#3A6DB0", "#D93227", "gray") , 
+                           breaks = c("Decreased", "Increased", "NS")) +
+        
+        geom_vline(xintercept = 0.585, linetype = "dashed", color = "black") +
+        geom_vline(xintercept = -0.585, linetype = "dashed", color = "black") +
+  
+        geom_label_repel(data = deseq_res_ac_volcano %>% filter(gene_cleaned %in% volcano_genes_ac) %>% filter(-log10(padj) > 100),
+                         aes(color = diffexpr, label = gene_cleaned, y = -log10(padj)),
+                        show.legend = FALSE,
+                        max.overlaps = 12,
+                        fill = "white",
+                        size = 5,
+                        label.r = 0.2,
+                        label.size = 0.5,
+                        min.segment.length = 0) + 
+
+        xlim(-6, 6) +
+        scale_y_continuous(limits = c(100, 400), n.breaks = 2) + 
+  
+        labs(y = bquote(~-Log[10]~'(BH-adjusted p-value)')) + 
+  
+        theme_minimal() + 
+      
+        theme(axis.line.y = element_line(colour = "black"), 
+              axis.line.x = element_blank(),
+              axis.title.x  = element_blank(),
+              axis.title.y = element_text(margin = ggplot2::margin(r = 15), size = 17),
+              axis.text.x = element_blank(),
+              axis.text.y = element_text(size = 15),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              panel.border = element_blank(),
+              legend.position = "none") 
+
+# Make patchwork and save
+volcano_ac <- volcano_ac_upper / volcano_ac_lower + 
+  plot_layout(heights = c(1, 3), axis_titles = "collect")
+
+png("4_Figures/Volcano_Acute.png", width = 5.25, height = 5, units = "in", res = 1200)
+volcano_ac
+invisible(dev.off())
+
+volcano_ac
+```
+
+### Chronic exposure
+
+```{r}
+# Lower plot
+volcano_re_lower <- deseq_res_re_volcano %>% filter(-log10(padj) < 30) %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj), color = diffexpr)) +
+        geom_point(alpha = 0.7, aes(y = -log10(padj))) + 
+        scale_color_manual(values = c("#3A6DB0", "#D93227", "gray") , 
+                           breaks = c("Decreased", "Increased", "NS")) +
+        
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+        geom_vline(xintercept = 0.585, linetype = "dashed", color = "black") +
+        geom_vline(xintercept = -0.585, linetype = "dashed", color = "black") +
+  
+        geom_label_repel(data = deseq_res_re_volcano %>% 
+                           filter(gene != "NQO1_1") %>% 
+                           filter(gene_cleaned %in% volcano_genes_re) %>% 
+                           filter(-log10(padj) < 32),
+                         aes(color = diffexpr, label = gene_cleaned, y = -log10(padj)),
+                        show.legend = FALSE,
+                        max.overlaps = 12,
+                        fill = "white",
+                        size = 5,
+                        label.r = 0.2,
+                        label.size = 0.5,
+                        min.segment.length = 0,
+                        force = 10) + 
+
+        xlim(-6, 6) +
+        scale_y_continuous(limits = c(0, 32)) + 
+  
+        labs(x = bquote(~Log[2]~'(Fold Change)'),
+             y = bquote(~-Log[10]~'(BH-adjusted p-value)')) +
+      
+        theme(axis.line = element_line(colour = "black"), 
+              axis.title.x = element_text(margin = ggplot2::margin(t = 15), size = 17),
+              axis.title.y = element_text(margin = ggplot2::margin(r = 15), size = 17),
+              axis.text = element_text(size = 15),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              panel.border = element_blank(),
+              legend.title = element_blank(),
+              legend.text = element_text(size = 15),
+              legend.position = "bottom",
+              legend.justification = "center",
+              legend.box.background = element_rect(color = "gray25")) 
+
+# Upper plot
+volcano_re_upper <- deseq_res_re_volcano %>% filter(-log10(padj) > 100) %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj), color = diffexpr)) +
+        geom_point(alpha = 0.7, aes(y = -log10(padj))) + 
+        scale_color_manual(values = c("#3A6DB0", "#D93227", "gray") , 
+                           breaks = c("Decreased", "Increased", "NS")) +
+        
+        geom_vline(xintercept = 0.585, linetype = "dashed", color = "black") +
+        geom_vline(xintercept = -0.585, linetype = "dashed", color = "black") +
+  
+        geom_label_repel(data = deseq_res_re_volcano %>% filter(gene_cleaned %in% volcano_genes_re) %>% filter(-log10(padj) > 100),
+                         aes(color = diffexpr, label = gene_cleaned, y = -log10(padj)),
+                        show.legend = FALSE,
+                        max.overlaps = 12,
+                        fill = "white",
+                        size = 5,
+                        label.r = 0.2,
+                        label.size = 0.5,
+                        min.segment.length = 0) + 
+
+        xlim(-6, 6) +
+        scale_y_continuous(limits = c(100, 400), n.breaks = 2) + 
+  
+        labs(y = bquote(~-Log[10]~'(BH-adjusted p-value)')) + 
+  
+        theme_minimal() + 
+      
+        theme(axis.line.y = element_line(colour = "black"), 
+              axis.line.x = element_blank(),
+              axis.title.x  = element_blank(),
+              axis.title.y = element_text(margin = ggplot2::margin(r = 15), size = 17),
+              axis.text.x = element_blank(),
+              axis.text.y = element_text(size = 15),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              panel.border = element_blank(),
+              legend.position = "none") 
+
+# Make patchwork and save
+volcano_re <- volcano_re_upper / volcano_re_lower + 
+  plot_layout(heights = c(1, 3), axis_titles = "collect")
+
+png("4_Figures/Volcano_Repeated.png", width = 5.25, height = 5, units = "in", res = 1200)
+volcano_re
+invisible(dev.off())
+
+volcano_re
+```
+
+## IPA results
+
+Import IPA pathway results:
+```{r}
+ipa_res_ac <- read.xlsx("1_RawData/RawData_IPA_Results_Acute.xlsx") %>%
+  clean_names() %>%
+  dplyr::rename("neg_log_padj" = "log_b_h_p_value")
+  
+ipa_res_re <- read.xlsx("1_RawData/RawData_IPA_Results_Repeated.xlsx") %>%
+  clean_names() %>%
+  dplyr::rename("neg_log_padj" = "log_b_h_p_value")
+```
+
+From IPA documentation: "Z-scores that are greater than or equal to 2 represent predictions of activation, while predictions of inhibition are made for z-scores less than or equal to -2. Gray bars indicate pathways that are constructed in such a way that no activity prediction can currently be made. White bars indicate (1) pathways with z-scores at or very close to 0; or (2) those that are ineligible for analysis because there are fewer than four analysis-ready molecules in the dataset associated with the pathway (z-score = NaN)."
+
+Here we will focus only pathways with an assigned z-score greater than 2 or less than -2, and pathways with a significant p-value. 
+
+Graph results:
+```{r}
+# Filter results to only include pathways with z scores that are significant
+ipa_res_ac_filtered <- ipa_res_ac %>%
+  mutate(z_score = as.numeric(z_score)) %>%
+  filter(!is.na(z_score)) %>%
+  filter(z_score < -2 | z_score > 2) %>%
+  filter(neg_log_padj > 1.3)
+
+ipa_res_re_filtered <- ipa_res_re %>%
+  mutate(z_score = as.numeric(z_score)) %>%
+  filter(!is.na(z_score)) %>%
+  filter(z_score < -2 | z_score > 2) %>%
+  filter(neg_log_padj > 1.3)
+  
+# Acute Graph
+ipa_res_graph_ac <- ggplot(ipa_res_ac_filtered, aes(x = z_score, y = reorder(ingenuity_canonical_pathways, z_score)))+
+  geom_col(aes(fill = z_score), color = "black", width = 0.7, size = 0.5) +
+  scale_fill_gradient2(low = "#3A6DB0", mid = "#FEFDC2", high = "#D93227", midpoint = 0, name = "Z-Score") +
+  geom_vline(xintercept = 0, col = "black", size = 0.5) +
+  scale_y_discrete(position = "right") +
+  labs(x = "z-score", title = "Pathways: Acute Exposure") +
+  xlim(-4, 4) +
+  theme(plot.title = element_text(size = "22", color = "black", face = "bold", hjust = 0.5),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 20, color = "black"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        axis.text.x = element_text(size = 18, color = "black"),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 18),
+        legend.background = element_rect(colour = 'grey', fill = 'white', linetype='solid'),
+        legend.position = c(0.25, 0.8))
+
+# Optionally save plot
+#png(file = "2_OutputFigs/IPA_Pathways_Acute.png",
+    #width = 15, height = 8, units = "in", res = 1200)
+#ipa_res_graph_ac
+#invisible(dev.off())
+
+#ipa_res_graph_ac
+
+# Chronic Graph
+ipa_res_graph_re <- ggplot(ipa_res_re_filtered, aes(x = z_score, y = reorder(ingenuity_canonical_pathways, z_score)))+
+  geom_col(aes(fill = z_score), color = "black", width = 0.7, size = 0.5) +
+  scale_fill_gradient2(low = "#3A6DB0", mid = "#FEFDC2", high = "#D93227", midpoint = 0, name = "Z-Score") +
+  geom_vline(xintercept = 0, col = "black", size = 0.5) +
+  scale_y_discrete(labels = scales::label_wrap(70), position = "right") +
+  labs(x = "z-score", title = "Pathways: Repeated Exposure") +
+  xlim(-4, 4) +
+  theme(plot.title = element_text(size = "22", color = "black", face = "bold", hjust = 0.5),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 20, color = "black"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        axis.text.x = element_text(size = 18, color = "black"),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 18),
+        legend.background = element_rect(colour = 'grey', fill = 'white', linetype='solid'),
+        legend.position = c(0.75, 0.8))
+
+# Optionally save plot
+#png(file = "2_OutputFigs/IPA_Pathways_Repeated.png",
+    #width = 15, height = 8, units = "in", res = 1200)
+#ipa_res_graph_re
+#invisible(dev.off())
+
+#ipa_res_graph_re
+```
+
+
+How many pathways with significant z scores and p-values exist?
+
+```{r}
+ipa_path_ac_zandp <- ipa_res_ac %>%
+  mutate(z_score = as.numeric(z_score)) %>%
+  filter(neg_log_padj > 1.3 & z_score > 2 | neg_log_padj > 1.3 & z_score < -2)
+
+ipa_path_re_zandp <- ipa_res_re %>%
+  mutate(z_score = as.numeric(z_score)) %>%
+  filter(neg_log_padj > 1.3 & z_score > 2 | neg_log_padj > 1.3 & z_score < -2)
+
+length(intersect(ipa_path_ac_zandp$ingenuity_canonical_pathways, ipa_path_re_zandp$ingenuity_canonical_pathways))
+```
+
+Save filtered IPA results for summary table
+```{r}
+write.xlsx(ipa_res_ac_filtered %>%
+             mutate(molecules = gsub(",", ", ", molecules)) %>%
+             arrange(-z_score),
+           "5_Tables/IPA_Results_Acute_Filtered.xlsx")
+
+write.xlsx(ipa_res_re_filtered %>%
+             mutate(molecules = gsub(",", ", ", molecules)) %>%
+             arrange(-z_score),
+           "5_Tables/IPA_Results_Repeated_Filtered.xlsx")
+```
+
+
+How many pathways with just significant p-values (enrichment for that pathway but not specific to directionality of change) exist?
+```{r}
+ipa_path_ac_p <- ipa_res_ac %>%
+  filter(neg_log_padj > 1.3)
+
+ipa_path_re_p <- ipa_res_re %>%
+  filter(neg_log_padj > 1.3)
+
+length(intersect(ipa_path_ac_p$ingenuity_canonical_pathways, ipa_path_re_p$ingenuity_canonical_pathways))
+```
+
+How many pathways with just significant z-score exist?
+```{r}
+ipa_path_ac_z <- ipa_res_ac %>%
+  mutate(z_score = as.numeric(z_score)) %>%
+  filter(z_score > 2 | z_score < -2)
+
+ipa_path_re_z <- ipa_res_re %>%
+  mutate(z_score = as.numeric(z_score)) %>%
+  filter(z_score > 2 | z_score < -2)
+
+length(intersect(ipa_path_ac_z$ingenuity_canonical_pathways, ipa_path_re_z$ingenuity_canonical_pathways))
+```
+
+What is the gene that occurs the most in the significant pathways? 
+```{r}
+ipa_genes_ac <- ipa_path_ac_zandp %>%
+  pull("molecules") %>%
+  str_split(",") %>%
+  unlist() %>%
+  str_trim() %>%
+  tibble(gene = .) %>%
+  dplyr::count(gene, sort = TRUE)
+
+ipa_genes_re <- ipa_path_re_zandp %>%
+  pull("molecules") %>%
+  str_split(",") %>%
+  unlist() %>%
+  str_trim() %>%
+  tibble(gene = .) %>%
+  dplyr::count(gene, sort = TRUE)
+```
+
+

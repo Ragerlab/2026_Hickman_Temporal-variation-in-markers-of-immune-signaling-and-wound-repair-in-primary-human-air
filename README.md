@@ -6,6 +6,6 @@ The goal of this study was to understand the effects of acute and repeated expos
 
 **1_TEERandLDH:** Analysis of trans-epithelial electrical resistance (TEER) data and lactate dehydrogenase (LDH) cytotoxicity assay data.
 
-**2_RNAsew:** Analysis of bulk RNA sequencing data. 
+**2_RNAseq:** Analysis of bulk RNA sequencing data. 
 
 **3_SecretedProteins:** Secreted protein data preprocessing/filtering, imputation, and statistical analysis.

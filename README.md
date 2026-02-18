@@ -18,4 +18,4 @@ Script authors: Elise Hickman (ehickman@email.unc.edu), Jessie Chappel (jrchapp3
 
 **Study Overview**
 
-![Fig1.tiff](Fig1.tiff)
+!['Fig1.tiff'](Fig1.tiff)

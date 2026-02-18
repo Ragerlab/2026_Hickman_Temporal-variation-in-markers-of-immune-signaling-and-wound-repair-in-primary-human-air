@@ -18,4 +18,5 @@ Script authors: Elise Hickman (ehickman@email.unc.edu), Jessie Chappel (jrchapp3
 
 **Study Overview**
 
-!['Fig1.tiff'](Fig1.tiff)
+<img width="5844" height="3015" alt="Fig1" src="https://github.com/user-attachments/assets/0dce7b95-24f7-4861-b5c7-40eeda6a3ceb" />
+

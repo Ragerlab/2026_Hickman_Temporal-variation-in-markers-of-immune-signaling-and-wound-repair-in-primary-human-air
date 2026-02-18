@@ -6,7 +6,7 @@ The goal of this study was to understand the effects of acute and repeated expos
 
 + Hickman E, Chou C, Seifert C, Chappel J, Kim YH, Corteselli E, Rager J. Temporal variation in markers of immune signaling and wound repair in primary human airway epithelial cells following acute vs. repeated woodsmoke condensate exposure. In revision with Toxicological Sciences (February 2026). 
 
-**Directory Orientation**
+**Repository Structure**
 
 Script authors: Elise Hickman (ehickman@email.unc.edu), Jessie Chappel (jrchapp3@unc.edu)
 
@@ -18,4 +18,4 @@ Script authors: Elise Hickman (ehickman@email.unc.edu), Jessie Chappel (jrchapp3
 
 **Study Overview**
 
-![Image](Fig1.tiff)
+![Fig1.tiff](Fig1.tiff)
